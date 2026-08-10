@@ -1,9 +1,12 @@
 import streamlit as st
 import cv2
+import av
 import time
+import threading
 import plotly.graph_objects as go
 import pandas as pd
 from collections import deque
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 from detector import EmotionDetector
 
 EMOTION_COLORS = {
@@ -30,28 +33,6 @@ html, body, [class*="css"] {
 .stApp {
     background-color: #f5efe4;
 }
-
-.metric-card {
-    border: 1px solid #ddd4c0 !important;
-}
-
-
-.main-title {
-    font-family: 'Playfair Display', serif;
-    font-size: 2.4rem;
-    font-weight: 600;
-    color: #111827;
-    letter-spacing: -0.01em;
-    margin-bottom: 0.1rem;
-}
-
-.subtitle {
-    font-size: 0.95rem;
-    color: #6b7280;
-    font-weight: 400;
-    margin-bottom: 1.8rem;
-}
-
 .metric-card {
     background: linear-gradient(180deg, #ffffff 0%, #fafafa 100%);
     border: 1px solid #ececec;
@@ -60,12 +41,10 @@ html, body, [class*="css"] {
     box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
     transition: box-shadow 0.2s ease, transform 0.2s ease;
 }
-
 .metric-card:hover {
     box-shadow: 0 4px 16px rgba(0,0,0,0.07);
     transform: translateY(-1px);
 }
-
 .metric-label {
     font-size: 0.78rem;
     font-weight: 500;
@@ -74,14 +53,12 @@ html, body, [class*="css"] {
     letter-spacing: 0.04em;
     margin-bottom: 0.4rem;
 }
-
 .metric-value {
     font-size: 1.75rem;
     font-weight: 600;
     color: #111827;
     letter-spacing: -0.01em;
 }
-
 .metric-sub {
     font-size: 0.75rem;
     color: #a1a5ac;
@@ -107,32 +84,87 @@ acc_ph = col3.empty()
 speed_ph = col4.empty()
 
 def render_card(placeholder, label, value, sub):
-    placeholder.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-sub">{sub}</div></div>', unsafe_allow_html=True)
+    placeholder.markdown(
+        f'<div class="metric-card"><div class="metric-label">{label}</div>'
+        f'<div class="metric-value">{value}</div><div class="metric-sub">{sub}</div></div>',
+        unsafe_allow_html=True,
+    )
 
-render_card(status_ph, "Live Status", "Inactive", "Webcam not connected")
+render_card(status_ph, "Live Status", "Inactive", "Camera not connected")
 render_card(total_ph, "Total Detections", "0", "Since session start")
 render_card(acc_ph, "Model Accuracy", "94.6%", "Validation benchmark")
 render_card(speed_ph, "Avg Response Time", "0.00s", "Per frame")
-if "detector" not in st.session_state:
-    st.session_state.detector = EmotionDetector()
-if "total_detections" not in st.session_state:
-    st.session_state.total_detections = 0
-if "history" not in st.session_state:
-    st.session_state.history = deque(maxlen=30)
-if "emotion_counts" not in st.session_state:
-    st.session_state.emotion_counts = {"angry": 0, "disgust": 0, "fear": 0, "happy": 0, "sad": 0, "surprise": 0, "neutral": 0}
-if "recent_log" not in st.session_state:
-    st.session_state.recent_log = deque(maxlen=5)
-if st.button("Reset Session Stats"):
-    st.session_state.total_detections = 0
-    st.session_state.emotion_counts = {"angry": 0, "disgust": 0, "fear": 0, "happy": 0, "sad": 0, "surprise": 0, "neutral": 0}
-    st.session_state.history = deque(maxlen=30)
-    st.session_state.recent_log = deque(maxlen=5)
 
-run = st.checkbox("Start Detection")
-video_col, panel_col = st.columns([2, 1])
-frame_window = video_col.empty()
-panel_window = panel_col.empty()
+
+class EmotionVideoProcessor(VideoProcessorBase):
+    """Runs in a background thread. Processes frames coming from the VISITOR'S OWN camera
+    (sent via their browser), not from any camera on the server."""
+
+    def __init__(self):
+        self.detector = EmotionDetector()
+        self.lock = threading.Lock()
+        self.total_detections = 0
+        self.emotion_counts = {
+            "angry": 0, "disgust": 0, "fear": 0, "happy": 0,
+            "sad": 0, "surprise": 0, "neutral": 0,
+        }
+        self.history = deque(maxlen=30)
+        self.recent_log = deque(maxlen=5)
+        self.latest_label = None
+        self.latest_conf = 0
+        self.latest_emotions = {}
+        self.elapsed = 0.0
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        start = time.time()
+        results = self.detector.analyze(img)
+        elapsed = time.time() - start
+
+        with self.lock:
+            self.elapsed = elapsed
+            for face in results:
+                x, y, w, h = face["box"]
+                label, conf = self.detector.top_emotion_for(face["emotions"])
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(
+                    img, f"{label} {conf*100:.0f}%", (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+                )
+                self.total_detections += 1
+                self.emotion_counts[label] += 1
+                self.history.append((time.time(), label, conf))
+                face_crop = img[y:y + h, x:x + w].copy()
+                self.recent_log.appendleft(
+                    (face_crop, label, conf, time.strftime("%I:%M:%S %p"))
+                )
+                self.latest_label = label
+                self.latest_conf = conf
+                self.latest_emotions = face["emotions"]
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+st.markdown('<p class="section-header">Live Camera</p>', unsafe_allow_html=True)
+ctx = webrtc_streamer(
+    key="emotion-detector",
+    video_processor_factory=EmotionVideoProcessor,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"video": True, "audio": False},
+)
+
+if ctx.video_processor and st.button("Reset Session Stats"):
+    with ctx.video_processor.lock:
+        ctx.video_processor.total_detections = 0
+        ctx.video_processor.emotion_counts = {k: 0 for k in ctx.video_processor.emotion_counts}
+        ctx.video_processor.history.clear()
+        ctx.video_processor.recent_log.clear()
+
+panel_window = st.empty()
 
 st.markdown('<p class="section-header">Emotion Distribution</p>', unsafe_allow_html=True)
 chart_ph = st.empty()
@@ -140,70 +172,63 @@ st.markdown('<p class="section-header">Recent Detections</p>', unsafe_allow_html
 recent_ph = st.empty()
 st.markdown('<p class="section-header">Real-time Emotion Trend</p>', unsafe_allow_html=True)
 trend_ph = st.empty()
-cap = cv2.VideoCapture(0)
 
+if ctx.video_processor:
+    while ctx.state.playing:
+        proc = ctx.video_processor
+        with proc.lock:
+            total = proc.total_detections
+            elapsed = proc.elapsed
+            counts = dict(proc.emotion_counts)
+            history = list(proc.history)
+            recent_log = list(proc.recent_log)
+            label = proc.latest_label
+            conf = proc.latest_conf
+            emotions = dict(proc.latest_emotions)
 
-while run:
-    ret, frame = cap.read()
-    if not ret:
-        st.error("Webcam not found.")
-        break
+        render_card(status_ph, "Live Status", "Active", "Camera connected")
+        render_card(total_ph, "Total Detections", str(total), "Since session start")
+        render_card(speed_ph, "Avg Response Time", f"{elapsed:.2f}s", "Per frame")
 
-    start = time.time()
-    results = st.session_state.detector.analyze(frame)
-    elapsed = time.time() - start
+        if sum(counts.values()) > 0:
+            fig = go.Figure(data=[go.Pie(
+                labels=list(counts.keys()),
+                values=list(counts.values()),
+                hole=0.6,
+                marker=dict(colors=[EMOTION_COLORS.get(e, "#999999") for e in counts.keys()]),
+            )])
+            fig.update_layout(height=350, margin=dict(t=20, b=20))
+            chart_ph.plotly_chart(fig, use_container_width=True, key=f"donut_{time.time()}")
 
-    label, conf = None, 0
-    for face in results:
-        x, y, w, h = face["box"]
-        label, conf = st.session_state.detector.top_emotion_for(face["emotions"])
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(frame, f"{label} {conf*100:.0f}%", (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        st.session_state.total_detections += 1
-        st.session_state.emotion_counts[label] += 1
-        st.session_state.history.append((time.time(), label, conf))
-        face_crop = frame[y:y+h, x:x+w].copy()
-        st.session_state.recent_log.appendleft((face_crop, label, conf, time.strftime("%I:%M:%S %p")))
-
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame_window.image(frame_rgb)
-    render_card(status_ph, "Live Status", "Active", "Webcam connected")
-    render_card(total_ph, "Total Detections", str(st.session_state.total_detections), "Since session start")
-    render_card(speed_ph, "Avg Response Time", f"{elapsed:.2f}s", "Per frame")
-    counts = st.session_state.emotion_counts
-    if sum(counts.values()) > 0:
-        fig = go.Figure(data=[go.Pie(
-            labels=list(counts.keys()),
-            values=list(counts.values()),
-            hole=0.6,
-            marker=dict(colors=[EMOTION_COLORS.get(e, "#999999") for e in counts.keys()])
-        )])
-        fig.update_layout(height=350, margin=dict(t=20, b=20))
-        chart_ph.plotly_chart(fig, use_container_width=True, key=f"donut_{time.time()}")
-        if st.session_state.recent_log:
+        if recent_log:
             with recent_ph.container():
-                cols = st.columns(len(st.session_state.recent_log))
-                for i, (crop, lbl, cf, ts) in enumerate(st.session_state.recent_log):
+                cols = st.columns(len(recent_log))
+                for i, (crop, lbl, cf, ts) in enumerate(recent_log):
                     with cols[i]:
                         if crop.size > 0:
                             st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), use_container_width=True)
                         st.caption(f"**{lbl.title()}** {cf*100:.0f}%  \n{ts}")
-    if len(st.session_state.history) > 1:
-        df = pd.DataFrame(st.session_state.history, columns=["t", "emotion", "conf"])
-        df["t"] = pd.to_datetime(df["t"], unit="s")
-        fig2 = go.Figure()
-        for e in df["emotion"].unique():
-            sub = df[df["emotion"] == e]
-            fig2.add_trace(go.Scatter(
-                x=sub["t"], y=sub["conf"], mode="lines+markers", name=e.title(),
-                line=dict(color=EMOTION_COLORS.get(e, "#999999"))
-            ))
-        fig2.update_layout(height=300, xaxis_title="Time", yaxis_title="Confidence", margin=dict(t=20, b=20))
-        trend_ph.plotly_chart(fig2, use_container_width=True, key=f"trend_{time.time()}")
-    if label:
-        with panel_window.container():
-            st.subheader(f"{label.title()} — {conf*100:.0f}%")
-            for e, c in results[0]["emotions"].items():
-                st.progress(min(c, 1.0), text=f"{e.title()} {c*100:.0f}%")
-cap.release()  
+
+        if len(history) > 1:
+            df = pd.DataFrame(history, columns=["t", "emotion", "conf"])
+            df["t"] = pd.to_datetime(df["t"], unit="s")
+            fig2 = go.Figure()
+            for e in df["emotion"].unique():
+                sub = df[df["emotion"] == e]
+                fig2.add_trace(go.Scatter(
+                    x=sub["t"], y=sub["conf"], mode="lines+markers", name=e.title(),
+                    line=dict(color=EMOTION_COLORS.get(e, "#999999")),
+                ))
+            fig2.update_layout(height=300, xaxis_title="Time", yaxis_title="Confidence", margin=dict(t=20, b=20))
+            trend_ph.plotly_chart(fig2, use_container_width=True, key=f"trend_{time.time()}")
+
+        if label:
+            with panel_window.container():
+                st.subheader(f"{label.title()} — {conf*100:.0f}%")
+                for e, c in emotions.items():
+                    st.progress(min(c, 1.0), text=f"{e.title()} {c*100:.0f}%")
+
+        time.sleep(0.5)
+else:
+    render_card(status_ph, "Live Status", "Inactive", "Click START below to enable your camera")
+    st.info("Click **START** above to allow camera access. This works from any phone, laptop, or tablet — no install needed on their end.")
