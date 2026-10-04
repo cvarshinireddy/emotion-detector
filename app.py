@@ -173,9 +173,9 @@ recent_ph = st.empty()
 st.markdown('<p class="section-header">Real-time Emotion Trend</p>', unsafe_allow_html=True)
 trend_ph = st.empty()
 
-if ctx.video_processor:
+proc = ctx.video_processor
+if proc:
     while ctx.state.playing:
-        proc = ctx.video_processor
         with proc.lock:
             total = proc.total_detections
             elapsed = proc.elapsed
